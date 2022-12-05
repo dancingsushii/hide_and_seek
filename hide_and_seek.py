@@ -6,6 +6,8 @@ import json, threading, random, os, subprocess, time, uuid, ast
 import networkx as nx
 from queue import Queue, Empty
 from enum import Enum
+from regtest_utils import *
+# from clnutils import cln_parse_rpcversion
 
 import gurobipy as gp
 import numpy as np
@@ -38,6 +40,7 @@ class HideSeekMsgCode(Enum):
   REBALANCE_REJ_MSG_HEX = 0x4163
   # cycle flow information sharing #
   CYCLE_FLOW_REQ_MSG_HEX = 0x1045
+  CYCLE_FLOW_ACK_MSG_HEX = 0x1047
 
   @classmethod
   def has_value(cls, value):
@@ -180,7 +183,8 @@ def on_newmessage(plugin, origin, payload, request, **kwargs):
   """Dispatches incoming requests to request handlers and incoming responses into ResponseHandler queues."""
   d = json.loads(payload)
   message = RebalanceMessage(d['peer'], d['msgid'], d['mtype'], d['data'])
-  plugin.log(f"Received message {message.msg_id} of type {message.msg_type.value} from {message.peer}: {message.payload}")
+  peer_alias = get_peer_alias_from_id(message.peer)
+  plugin.log(f"Received message {message.msg_id} of type {message.msg_type.value} from {peer_alias}: {message.payload}")
   if response_handler.is_response(message.msg_id):
     response_handler.add_response(message.msg_id, message)
   elif message.msg_type == HideSeekMsgCode.REBALANCE_REQ_MSG_HEX:
@@ -229,7 +233,9 @@ def prepare_hide_seek(plugin, source_request: RebalanceMessage = None):
   # we are at initiator. it has the rebalancing_graph.
   for edge in rebalancing_graph.edges:
     graph_for_LP = rebalancing_graph.get_edge_data(edge[0], edge[1])
-    plugin.log(f"Edge between {edge[0]} and {edge[1]} has data: {graph_for_LP}")
+    edge_0_alias = get_peer_alias_from_id(edge[0])
+    edge_1_alias = get_peer_alias_from_id(edge[1])
+    plugin.log(f"Edge between {edge_0_alias} and {edge_1_alias} has data: {graph_for_LP}")
     
   
   balance_updates = LP_global_rebalancing(plugin, rebalancing_graph)
@@ -248,8 +254,10 @@ def prepare_hide_seek(plugin, source_request: RebalanceMessage = None):
       cycle_with_scid.append(quadriple)
   cycle_flows_with_scids.append(cycle_with_scid)
   plugin.log(f"The cycle flows with scid's are {cycle_flows_with_scids} ... ")
+  cycle_flow = cycle_flows_with_scids
 
-  for cycle_flow in cycle_flows:
+  # Changed cycle_flow to cycle_flows_with_scids 
+  for cycle_flow in cycle_flows_with_scids:
     cycle_members = list(map(lambda cycle: cycle[0], cycle_flow))
     
     if own_node_id in cycle_members:
@@ -257,31 +265,43 @@ def prepare_hide_seek(plugin, source_request: RebalanceMessage = None):
       htlc_creation_for_cycle(plugin, cycle_flow)
 
     else:
-      # We pick one random member m_i from each of the cycles.
-      random_member = random.choice(cycle_members)
-      # we send them (m_i) cycle information for them (m_i) to call HTLC for cycle creation.
-      try:
-        plugin.log(f"Sending cycle information to {random_member}")
-        cycle_information = str(cycle_flow)
-        send_cycle_flow(plugin, random_member, payload=cycle_information)
-        # wait for the response # TODO consider if we need to wait for request ACK!
-        # request_ack = response_handler.get_response(request_id, 60) # TODO add timeout value to params region CYCLE_FLOW_REQUEST_TIMEOUT_S
-        # except Empty:
-        # plugin.log(f"Sending cycle information to {random_member} timed out!") 
-        # TODO if request timed out, pick another member! Go back to last else:
-
-      except Exception as e:
-        error = str(e)
-        plugin.log(f"Unknown error occured while sending cycle information to {random_member}. Exception: {error}") 
+      # Control who will be delegated to control cycle flow and retry for 180 seconds until picked candidate sends an ack
+      cycle_flow_delegate_picked = False
+      start, how_long_to_try_candidates_sec = time.time(), 180
+      while not cycle_flow_delegate_picked:
+        if time.time() - start >= how_long_to_try_candidates_sec:
+          # we did not manage to an ACK from any of the candidates in time -_0_-
+          plugin.log(f"Error: WE TIMED OUT")
+          # exit(-1) TODO? up to you @dancingsushi
+        # We pick one random member m_i from each of the cycles.
+        random_member = random.choice(cycle_members)
+        random_member_peer_alias = get_peer_alias_from_id(random_member)
+        # we send them (m_i) cycle information for them (m_i) to call HTLC for cycle creation.
+        try:
+          plugin.log(f"Sending cycle information to {random_member_peer_alias}")
+          cycle_information = str(cycle_flow)
+          request_id = send_cycle_flow(plugin, random_member, payload=cycle_information)
+          # wait for the response
+          request_ack = response_handler.get_response(request_id, CYCLE_FLOW_REQUEST_TIMEOUT_S)
+          # we exit from the while-loop
+          cycle_flow_delegate_picked = True
+        except Empty as e:
+          plugin.log(f"Cycle flow request to candidate {random_member_peer_alias} timed out without ACK after {CYCLE_FLOW_REQUEST_TIMEOUT_S} seconds. Picking next candidate.")
+          continue
+        except Exception as e:
+          error = str(e)
+          plugin.log(f"Unknown error occured while sending cycle information to {random_member_peer_alias}. Exception: {error}") 
+      # continue with your logic here
 
 def collect_neighbors_replies(plugin, initiator_id: str, participants: list, rejectors: list, search_depth: int, accum_depth: int, rebalancing_graph: nx.DiGraph) -> nx.DiGraph:
   """Goes through neighbors, sends rebalance out requests and collects their local graphs into the common ``rebalancing_graph``"""
   neighbor_ids = get_neighbor_ids(plugin)
   for neighbor_id in neighbor_ids:
+    peer_alias = get_peer_alias_from_id(neighbor_id)
     if neighbor_id in participants or neighbor_id in rejectors:
-      plugin.log(f"Neighbor {neighbor_id} already received invititation to participate.")
+      plugin.log(f"Neighbor {peer_alias} already received invititation to participate.")
       continue
-    plugin.log(f'Daemon picking {neighbor_id} to send rebalance out')
+    plugin.log(f'Daemon picking {peer_alias} to send rebalance out')
     try:
       request_body = RebalanceRequestBody(initiator_id, participants, rejectors, search_depth, accum_depth)
       # send rebalance_request to neighbor
@@ -290,7 +310,7 @@ def collect_neighbors_replies(plugin, initiator_id: str, participants: list, rej
       response = response_handler.get_response(request_id, REBALANCE_REQ_TIMEOUT_S)
       # if peer rejected or response not recognized
       if response.msg_type == HideSeekMsgCode.REBALANCE_REJ_MSG_HEX:
-        plugin.log(f'Peer {response.peer} responded with an REJ to request {request_id}')
+        plugin.log(f'Peer {peer_alias} responded with an REJ to request {request_id}')
         rejectors.append(neighbor_id)
         continue
       if response.msg_type != HideSeekMsgCode.REBALANCE_ACC_MSG_HEX:
@@ -298,7 +318,7 @@ def collect_neighbors_replies(plugin, initiator_id: str, participants: list, rej
         raise Exception(f'Received a response of unexpected type {response.msg_id} as a reply to request {request_id}')
         continue
       # ... peer accepted then
-      plugin.log(f'Peer {response.peer} responded with an ACK to request {request_id}. Waiting for the graph data from the peer now...')
+      plugin.log(f'Peer {peer_alias} responded with an ACK to request {request_id}. Waiting for the graph data from the peer now...')
       # wait for neighbors rebalance response with rebalancing data
       response = response_handler.get_response(request_id, REBALANCE_RES_TIMEOUT_S)
       plugin.log(f"Response arrived! Parsing response to retrieve participants, rejectors and graph data.")
@@ -313,7 +333,7 @@ def collect_neighbors_replies(plugin, initiator_id: str, participants: list, rej
       if os.path.exists(filename): os.remove(filename)
       with open(filename, "wb") as f:
         f.write(bytes.fromhex(response_graph_data))
-      plugin.log(f"Graph data from host {neighbor_id} written into the file {filename}. Reading graph data from there...")
+      plugin.log(f"Graph data from host {peer_alias} written into the file {filename}. Reading graph data from there...")
       peers_rebalancing_graph: nx.DiGraph = nx.read_gpickle(filename)
       plugin.log(f"Delivered graph contains {len(peers_rebalancing_graph.nodes)} nodes and {len(peers_rebalancing_graph.edges)} edges")
       # merge the existing rebalancing_graph with TODO read this methods docks after accomplishing the correct data collection
@@ -334,7 +354,7 @@ def handle_incoming_hide_seek_request(plugin, request:RebalanceMessage):
   # decide using nodes own objection function if rebalancing makes sense
   if not decide_to_participate(plugin):
     plugin.log("There is no need to participate in rebalancing for me.")
-    send_rebalance_rej(plugin, request.peer)
+    send_rebalance_rej(plugin, request.peer, request.msg_id)
     return
   # simply send ACK for now, need to check if ResponseHandler works properly
   send_rebalance_ack(plugin, request.peer, request.msg_id)
@@ -344,12 +364,12 @@ def handle_incoming_hide_seek_request(plugin, request:RebalanceMessage):
   threading.Thread(name="handler", target=prepare_hide_seek, args=(plugin, request)).start()
 
 def handle_incoming_cycle_flow_processing_request(plugin, request:RebalanceMessage):
-  # TODO add ACK logic if we want to get ACK for received cycle in order to retransmit the cycle to another random peer
+  send_cycle_flow_ack(plugin, request.peer, request.msg_id)
   plugin.log(f"Cycle flow: {request.payload} received... ")
   deserialized_cycle = ast.literal_eval(request.payload)
   htlc_creation_for_cycle(plugin, deserialized_cycle)
 
-def send_rebalance_out(plugin, peer_id, request_body: RebalanceRequestBody) -> int:
+def send_rebalance_out(plugin, peer_id, request_body: RebalanceRequestBody):
   """Sends rebalance out request to given peer_id."""
   payload = request_body.toString()
   msgtype = HideSeekMsgCode.REBALANCE_REQ_MSG_HEX
@@ -367,9 +387,16 @@ def send_rebalance_rej(plugin, peer_id, request_id):
 def send_rebalance_ack(plugin, peer_id, request_id):
   """Sends rebalance ACK response to given peer_id."""
   own_id = get_node_id(plugin)
-  payload = f"ACK from {own_id}"
+  payload = f"ACK from {own_id} for rebalance out request"
   msgtype = HideSeekMsgCode.REBALANCE_ACC_MSG_HEX
   msgid   = int(request_id, base=0)
+  send_message(plugin, peer_id, msgtype, payload, msgid)
+
+def send_cycle_flow_ack(plugin, peer_id, request_id):
+  own_id = get_node_id(plugin)
+  payload = f"ACK from {own_id} for cycle flow request"
+  msgtype = HideSeekMsgCode.CYCLE_FLOW_ACK_MSG_HEX
+  msgid = int(request_id, base=0)
   send_message(plugin, peer_id, msgtype, payload, msgid)
 
 def send_rebalance_res(plugin, source_request: RebalanceMessage, rebalancing_graph: nx.DiGraph, participants: list, rejectors: list):
@@ -397,11 +424,12 @@ def send_cycle_flow(plugin, peer_id, payload):
   """Sends cycle flow request to given peer_id."""
   plugin.log(f"Send cycle flow: {payload} to peer: {peer_id}...")
   # expect_response=True,  response_handler=response_handler deleted since we don't use ACK's now
-  send_message(plugin, peer_id, HideSeekMsgCode.CYCLE_FLOW_REQ_MSG_HEX, payload)
+  request_id = send_message(plugin, peer_id, HideSeekMsgCode.CYCLE_FLOW_REQ_MSG_HEX, payload, expect_response=True, response_handler=response_handler)
+  return request_id
 
-# #endregion
+#endregion
 
-# #region graph logic
+#region graph logic
 
 def get_node_id(plugin):
   return plugin.rpc.getinfo()["id"]
@@ -500,9 +528,9 @@ def extend_rebalancing_graph(plugin, own_id, rebalancing_graph: nx.DiGraph) -> n
 
   return rebalancing_graph
   
-# #endregion
+#endregion
 
-# # region MPC blackbox
+# region MPC blackbox
 
 def append_to_A(d, r, c, data, row, col):
   # append single items or lists to data, row, col
@@ -576,7 +604,6 @@ def LP_global_rebalancing(plugin, rebalancing_graph) -> list:
 
                 # ineq 2b: - \sum_{out edges} f(u,v)
                 append_to_A(-1, 2 * m + n + i, edge_index, data, row, col)
-                plugin.log(f'Row number is {row}')
 
             for edge in rebalancing_graph.in_edges(u):
                 edge_index = list_of_edges.index(edge)
@@ -595,8 +622,6 @@ def LP_global_rebalancing(plugin, rebalancing_graph) -> list:
         A = sp.csr_matrix((data, (row, col)), shape=(A_num_of_rows, A_num_of_columns))
 
         # Add constraints and optimize model
-        plugin.log(f'A.data is {A.data}')
-        plugin.log(f'RHS is {rhs}')
         model.addConstr(A @ x <= rhs, name="matrix form constraints")
         model.optimize()
 
@@ -617,7 +642,6 @@ def LP_global_rebalancing(plugin, rebalancing_graph) -> list:
         for edge_index in range(m):
             u, v = list_of_edges[edge_index]
             balance_updates.append((u, v, int(flows[edge_index])))
-            plugin.log(f'Balance updates is constructing {balance_updates}')
 
         return balance_updates
 
@@ -628,7 +652,8 @@ def LP_global_rebalancing(plugin, rebalancing_graph) -> list:
         plugin.log('Encountered an attribute error')
 
 def cycle_decomposition(balance_updates) -> list:
-    # Step 6: Cycle decomposition on MPC delegate
+
+    # TODO check because this doesn't work on 5 nodes graph
     # TODO Enhancement add case where the model received from 1LP is infeasible meaning there will be nothing to route
     cycle_flows = [[]]
 
@@ -759,6 +784,61 @@ def sort_cycle(current: str, cycle: list, result_cycle: list) -> list:
   current = current_tuple[1]
   cycle.remove(current_tuple)
   return sort_cycle(current, cycle, result_cycle)
+
+def assignDirections(edge) -> int:
+  src, dst = edge[0], edge[1]
+  if src < dst:
+    return 0
+  else:
+    return 1 
+
+# def route_set_msat(obj, msat):
+#     if plugin.rpcversion[0] == 0 and plugin.rpcversion[1] < 12:
+#         obj[plugin.msatfield] = msat.millisatoshis
+#         obj['amount_msat'] = Millisatoshi(msat)
+#     else:
+#         obj[plugin.msatfield] = Millisatoshi(msat)
+
+
+def route_get_msat(r):
+    return Millisatoshi(r[plugin.msatfield])
+
+def setup_routing_fees(route, msat):
+    delay = 10
+    plugin.log(f'We will construct a correct {route} for reversed route ...')
+    for r in reversed(route):
+        plugin.log(f'Going into the loop with reversed route and current hop is {r}...')
+        r[plugin.msatfield] = Millisatoshi(msat)
+        plugin.log(f'Delay (cltv) of {r} is now {delay}...')
+        r['delay'] = delay
+        channels = plugin.rpc.listchannels(r['channel'])
+        plugin.log(f'List channels: {channels}...')
+        ch = next(c for c in channels.get('channels') if c['destination'] == r['id'])
+        plugin.log(f'Ch is: {ch}...')
+        fee = Millisatoshi(ch['base_fee_millisatoshi'])
+        plugin.log(f'Set fee to {fee}...')
+        # BOLT #7 requires fee >= fee_base_msat + ( amount_to_forward * fee_proportional_millionths / 1000000 )
+        fee += (msat * ch['fee_per_millionth'] + 10**6 - 1) // 10**6  # integer math trick to round up
+        plugin.log(f'Fee changed to {fee}...')
+        msat += fee
+        delay += ch['delay']
+        plugin.log(f'End result is: {r}')
+
+
+def waitsendpay(payment_hash, start_ts, retry_for):
+    while True:
+        try:
+            timeout = min(max(retry_for + start_ts - int(time.time()), 0), 10)
+            result = plugin.rpc.waitsendpay(payment_hash, timeout)
+            return result
+        except RpcError as e:
+            if e.method == "waitsendpay" and e.error.get('code') == 200:
+                if plugin.rebalance_stop:
+                    raise e
+                if int(time.time()) - start_ts >= retry_for:
+                    raise e
+            else:
+                raise e
   
 
 def htlc_creation_for_cycle(plugin, cycle: list, retry_for: int = 60):
@@ -767,6 +847,7 @@ def htlc_creation_for_cycle(plugin, cycle: list, retry_for: int = 60):
     Is initiated randomly on one of the cycle participant after 1LP calculation.
     """
     plugin.log('Starting htlc_creation_for_cycles method...')
+    plugin.log(f'Received cycle is {cycle}...')
 
     my_node_id = get_node_id(plugin)
 
@@ -810,8 +891,8 @@ def htlc_creation_for_cycle(plugin, cycle: list, retry_for: int = 60):
 
     plugin.log(f"Starting rebalance out_scid:{outgoing_scid} in_scid:{incoming_scid} amount:{msatoshi}", 'debug')
     plugin.log('Creating timelock for cycle...')
-    route_out = {'id': outgoing_node_id, 'channel': outgoing_scid, 'direction': int(not my_node_id < outgoing_node_id)}
-    route_in = {'id': my_node_id, 'channel': incoming_scid, 'direction': int(not incoming_node_id < my_node_id)}
+    route_out = {'id': outgoing_node_id, 'channel': outgoing_scid, 'direction': int(not my_node_id < outgoing_node_id), 'msatoshi': int(msatoshi), 'amount_msat': msatoshi, 'style': 'tlv'}
+    route_in = {'id': my_node_id, 'channel': incoming_scid, 'direction': int(not incoming_node_id < my_node_id), 'msatoshi': int(msatoshi), 'amount_msat': msatoshi, 'style': 'tlv'}
     start_ts = int(time.time())
     label = "Rebalance-" + str(uuid.uuid4())
     description = "%s to %s" % (outgoing_scid, incoming_scid)
@@ -819,12 +900,13 @@ def htlc_creation_for_cycle(plugin, cycle: list, retry_for: int = 60):
 
     plugin.log('Creating invoice for the whole cycle...')
     invoice = plugin.rpc.invoice(msatoshi, label, description, retry_for + 60)
+    bolt11 = invoice['bolt11']
+    plugin.log('Creating a hash for this secret for the whole cycle...')
+    payment_hash = invoice['payment_hash']
+    plugin.log(f'Payment hash is {payment_hash}...')
 
     plugin.log('Creating payment_secret for the whole cycle...')
     payment_secret = invoice.get('payment_secret')
-
-    plugin.log('Creating a hash for this secret for the whole cycle...')
-    payment_hash = invoice['payment_hash']
 
     rpc_result = None
     excludes = [my_node_id]  
@@ -834,9 +916,10 @@ def htlc_creation_for_cycle(plugin, cycle: list, retry_for: int = 60):
     time_getroute = 0
     time_sendpay = 0
 
+    plugin.log('Getting into the main loop for initializing a HTLC...')
+
     try:
         while int(time.time()) - start_ts < retry_for:
-
             plugin.log(f"Setting the timer for {time.time() - start_ts} being less then {retry_for}")
             plugin.log('Trying to construct the midroute from cycle...')
 
@@ -845,16 +928,18 @@ def htlc_creation_for_cycle(plugin, cycle: list, retry_for: int = 60):
             edges_mid = cycle[1:-1]
             route_mid = []
 
+            plugin.log(f"Converting mid_edges {edges_mid} to hops to create a route...")
             for edge in edges_mid:
+              direction = assignDirections(edge)
               plugin.log(f"Casting amount of satoshi in satoshi for {edge}...")
-              # TODO Check if scid's read correctly, Here we have a problem, fix this
-              hop = {'id': edge[1], 'channel': edge[3],'msatoshi': edge[2], 'amount_msat': Millisatoshi(edge[2])}
+              amount_msat = str(edge[2])+"msat"
+              hop = {'id': edge[1], 'channel': edge[3], 'direction': direction, 'msatoshi': int(msatoshi), 'amount_msat': amount_msat, 'style': 'tlv'}
               route_mid.append(hop)
             
-            plugin.log(f"The intermediary edges are {edges_mid} and a mid route is {route_mid}")
-            plugin.log(f'Parse the edges in edges_mid to route... rpc_result is: {rpc_result}')
-            
+            plugin.log(f"A mid route is {route_mid}")
             route = [route_out] + route_mid + [route_in]
+            setup_routing_fees(route, msatoshi)
+            #fees = route_get_msat(route[0]) - msatoshi
 
             rpc_result = {
                 "sent": msatoshi,
@@ -866,20 +951,25 @@ def htlc_creation_for_cycle(plugin, cycle: list, retry_for: int = 60):
                 "message": f"{msatoshi} sent over {len(cycle)} hops to rebalance {msatoshi}",
             }
 
-            midroute_str = reduce(lambda x,y: x + " -> " + y, map(lambda r: get_node_alias(r['id']), route_mid))
-            full_route_str = "%s -> %s -> %s -> %s" % (get_node_alias(my_node_id), get_node_alias(outgoing_node_id), midroute_str, get_node_alias(my_node_id))
-            plugin.log("%d hops and %s fees for %s along route: %s" % (len(cycle), msatoshi.to_satoshi_str(), full_route_str))
+            plugin.log(f'Parse the edges in edges_mid to route... rpc_result is: {rpc_result}')
+            # Check this, maybe the route is constructed false
+            # midroute_str = reduce(lambda x,y: x + " -> " + y, map(lambda r: get_node_alias(r['id']), route_mid))
+            # full_route_str = "%s -> %s -> %s -> %s" % (get_node_alias(my_node_id), get_node_alias(outgoing_node_id), midroute_str, get_node_alias(my_node_id))
+            # plugin.log("%d hops and %s fees for %s along route: %s" % (len(cycle), msatoshi.to_satoshi_str(), full_route_str))
 
             time_start = time.time()
             count_sendpay += 1
 
             try:
-                plugin.log('Executing sendpay...')
-                plugin.rpc.sendpay(route, payment_hash, payment_secret=payment_secret)
-                running_for = int(time.time()) - start_ts
-                result = plugin.rpc.waitsendpay(payment_hash, max(retry_for - running_for, 0))
+                plugin.log(f"Let me show the route... route is: {route}")
+                plugin.log(f'Payment hash is {payment_hash}...')
+                plugin.rpc.sendpay(route, payment_hash, payment_secret=payment_secret, bolt11=bolt11)
+                result = waitsendpay(payment_hash,  start_ts, retry_for)
+                plugin.log('Executing waitsendpay...')
                 time_sendpay += time.time() - time_start
+                plugin.log('Waiting for the status complete...')
                 if result.get('status') == "complete":
+                  # TODO for today deal with {count} which is not defined here 
                     rpc_result["stats"] = f"running_for:{int(time.time()) - start_ts}  count_getroute:{count}  time_getroute:{time_getroute}  time_getroute_avg:{time_getroute / count}  count_sendpay:{count_sendpay}  time_sendpay:{time_sendpay}  time_sendpay_avg:{time_sendpay / count_sendpay}"
                     return cleanup(label, payload, rpc_result)
 
@@ -918,9 +1008,28 @@ def htlc_creation_for_cycle(plugin, cycle: list, retry_for: int = 60):
 # add response handler for global access
 response_handler = ResponseHandler()
 
+# add node_id --> alias dictionary to simplify debugging
+_node_id_to_alias = dict()
+
+def get_peer_alias_from_id(node_id: str) -> str:
+  if node_id not in _node_id_to_alias: 
+    d = get_node_id_to_alias_dict()
+    for key, value in d.items():
+      _node_id_to_alias[key] = value
+  return _node_id_to_alias[node_id]
+  
+
 @plugin.init()
 def init(options, configuration, plugin):
     plugin.log("Plugin hide_and_seek.py initialized.")
+    # plugin.getinfo = plugin.rpc.getinfo()
+    # plugin.rpcversion = cln_parse_rpcversion(plugin.getinfo.get('version'))
+
+    # # use getroute amount_msat/msatoshi field depending on version
+    plugin.msatfield = 'amount_msat'
+    # if plugin.rpcversion[0] == 0 and plugin.rpcversion[1] < 12:
+    #     plugin.msatfield = 'msatoshi'
+
     return
 
 
